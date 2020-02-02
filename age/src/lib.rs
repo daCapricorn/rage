@@ -105,6 +105,7 @@ mod error;
 mod format;
 pub mod keys;
 mod openssh;
+mod plugin;
 mod primitives;
 mod protocol;
 mod util;
