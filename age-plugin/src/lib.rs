@@ -162,3 +162,85 @@
 //!   configuration support; instead of only needing one per-user folder, we would also
 //!   need to handle system configuration folders across various platforms, as well as be
 //!   safe across OS upgrades.
+
+use cookie_factory::SerializeFn;
+use std::fmt;
+use std::io::{self, BufReader, Write};
+
+mod format;
+
+#[derive(Debug)]
+pub struct RecipientLine {
+    pub tag: String,
+    pub args: Vec<String>,
+    pub body: Vec<u8>,
+}
+
+pub trait AgeError: fmt::Display {
+    fn code(&self) -> u16;
+}
+
+pub trait AgePlugin {
+    type Error: AgeError;
+
+    fn wrap_file_key(
+        &mut self,
+        file_key: &[u8],
+        recipient: &str,
+    ) -> Result<RecipientLine, Self::Error>;
+}
+
+#[derive(Debug)]
+pub enum Error<P: AgePlugin> {
+    Io(io::Error),
+    Plugin(P::Error),
+}
+
+impl<P: AgePlugin> From<io::Error> for Error<P> {
+    fn from(e: io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+fn write_reply<'a, F: SerializeFn<&'a mut io::Stdout>>(
+    output: &'a mut io::Stdout,
+    f: F,
+) -> io::Result<()> {
+    cookie_factory::gen_simple(f, output)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to write response: {}", e),
+            )
+        })?
+        .flush()
+}
+
+pub fn run_plugin<P: AgePlugin>(mut plugin: P) -> io::Result<()> {
+    use crate::format::{write, Command};
+    use age_core::format::AgeStanza;
+
+    let mut input = BufReader::new(io::stdin());
+    let mut output = io::stdout();
+
+    loop {
+        // TODO: Handle "UnexpectedEof"
+        match Command::read(&mut input)? {
+            Command::WrapFileKey {
+                recipient,
+                file_key,
+            } => match plugin.wrap_file_key(&file_key, &recipient) {
+                Ok(r) => {
+                    let args: Vec<_> = r.args.iter().map(|s| s.as_str()).collect();
+                    let stanza = AgeStanza {
+                        tag: &r.tag,
+                        args,
+                        body: r.body,
+                    };
+                    write_reply(&mut output, write::ok(&stanza))?;
+                }
+                Err(e) => write_reply(&mut output, write::error(e.code(), &format!("{}", e)))?,
+            },
+        }
+    }
+}
