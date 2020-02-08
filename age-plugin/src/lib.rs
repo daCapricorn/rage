@@ -164,6 +164,7 @@
 //!   safe across OS upgrades.
 
 use cookie_factory::SerializeFn;
+use secrecy::SecretString;
 use std::fmt;
 use std::io::{self, BufReader, Write};
 
@@ -180,14 +181,30 @@ pub trait AgeError: fmt::Display {
     fn code(&self) -> u16;
 }
 
+pub trait AgeCallbacks {
+    fn prompt(&mut self, message: &str) -> io::Result<()>;
+
+    fn request_secret(&mut self, message: &str) -> io::Result<SecretString>;
+}
+
 pub trait AgePlugin {
     type Error: AgeError;
+
+    fn add_identity(&mut self, identity: String) -> Result<(), Self::Error>;
 
     fn wrap_file_key(
         &mut self,
         file_key: &[u8],
         recipient: &str,
     ) -> Result<RecipientLine, Self::Error>;
+
+    fn unwrap_file_key(
+        &mut self,
+        tag: &str,
+        args: &[String],
+        body: &[u8],
+        callbacks: impl AgeCallbacks,
+    ) -> Result<Vec<u8>, Self::Error>;
 }
 
 #[derive(Debug)]
@@ -216,6 +233,36 @@ fn write_reply<'a, F: SerializeFn<&'a mut io::Stdout>>(
         .flush()
 }
 
+struct Callbacks<'a> {
+    input: &'a mut io::BufReader<io::Stdin>,
+    output: &'a mut io::Stdout,
+}
+
+impl<'a> Callbacks<'a> {
+    fn new(input: &'a mut io::BufReader<io::Stdin>, output: &'a mut io::Stdout) -> Self {
+        Callbacks { input, output }
+    }
+}
+
+impl<'a> AgeCallbacks for Callbacks<'a> {
+    fn prompt(&mut self, message: &str) -> io::Result<()> {
+        write_reply(self.output, format::write::prompt(message))
+    }
+
+    fn request_secret(&mut self, message: &str) -> io::Result<SecretString> {
+        use crate::format::{write, Command};
+
+        write_reply(self.output, write::request_secret(message))?;
+        match Command::read(&mut self.input)? {
+            Command::Secret(secret) => Ok(secret),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Did not receive command 'secret' from client",
+            )),
+        }
+    }
+}
+
 pub fn run_plugin<P: AgePlugin>(mut plugin: P) -> io::Result<()> {
     use crate::format::{write, Command};
     use age_core::format::AgeStanza;
@@ -226,6 +273,17 @@ pub fn run_plugin<P: AgePlugin>(mut plugin: P) -> io::Result<()> {
     loop {
         // TODO: Handle "UnexpectedEof"
         match Command::read(&mut input)? {
+            Command::AddIdentity(identity) => match plugin.add_identity(identity) {
+                Ok(_) => {
+                    let stanza = AgeStanza {
+                        tag: "add-identity",
+                        args: vec![],
+                        body: vec![0],
+                    };
+                    write_reply(&mut output, write::ok(&stanza))?;
+                }
+                Err(e) => write_reply(&mut output, write::error(e.code(), &format!("{}", e)))?,
+            },
             Command::WrapFileKey {
                 recipient,
                 file_key,
@@ -241,6 +299,28 @@ pub fn run_plugin<P: AgePlugin>(mut plugin: P) -> io::Result<()> {
                 }
                 Err(e) => write_reply(&mut output, write::error(e.code(), &format!("{}", e)))?,
             },
+            Command::UnwrapFileKey { tag, args, body } => {
+                match plugin.unwrap_file_key(
+                    &tag,
+                    &args,
+                    &body,
+                    Callbacks::new(&mut input, &mut output),
+                ) {
+                    Ok(file_key) => {
+                        let stanza = AgeStanza {
+                            tag: "file-key",
+                            args: vec![],
+                            body: file_key,
+                        };
+                        write_reply(&mut output, write::ok(&stanza))?;
+                    }
+                    Err(e) => write_reply(&mut output, write::error(e.code(), &format!("{}", e)))?,
+                }
+            }
+            _ => write_reply(
+                &mut output,
+                write::error(20, "Command invalid at this time"),
+            )?,
         }
     }
 }

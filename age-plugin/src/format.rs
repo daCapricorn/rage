@@ -1,11 +1,19 @@
+use secrecy::SecretString;
 use std::io::{self, BufRead};
 
 #[derive(Debug)]
 pub(crate) enum Command {
+    AddIdentity(String),
     WrapFileKey {
         recipient: String,
         file_key: Vec<u8>,
     },
+    UnwrapFileKey {
+        tag: String,
+        args: Vec<String>,
+        body: Vec<u8>,
+    },
+    Secret(SecretString),
 }
 
 impl Command {
@@ -50,12 +58,22 @@ mod read {
         sequence::{pair, terminated},
         IResult,
     };
+    use secrecy::SecretString;
 
     use super::Command;
 
     pub(super) fn client_command(input: &[u8]) -> IResult<&[u8], Command> {
         terminated(
             map_opt(age_stanza, |command| match command.tag {
+                "add-identity" => {
+                    if !command.args.is_empty() {
+                        None
+                    } else {
+                        String::from_utf8(command.body)
+                            .ok()
+                            .map(Command::AddIdentity)
+                    }
+                }
                 "wrap-file-key" => {
                     if command.args.len() == 1 {
                         Some(Command::WrapFileKey {
@@ -64,6 +82,27 @@ mod read {
                         })
                     } else {
                         None
+                    }
+                }
+                "unwrap-file-key" => {
+                    if command.args.is_empty() {
+                        None
+                    } else {
+                        Some(Command::UnwrapFileKey {
+                            tag: command.args[0].to_owned(),
+                            args: command.args.into_iter().skip(1).map(String::from).collect(),
+                            body: command.body,
+                        })
+                    }
+                }
+                "secret" => {
+                    if !command.args.is_empty() {
+                        None
+                    } else {
+                        String::from_utf8(command.body)
+                            .ok()
+                            .map(SecretString::new)
+                            .map(Command::Secret)
                     }
                 }
                 _ => None,
@@ -98,6 +137,26 @@ pub(crate) mod write {
             let args = &[code.as_str()];
             let writer = tuple((
                 age_stanza("error", args, description.as_bytes()),
+                string("\n\n"),
+            ));
+            writer(w)
+        }
+    }
+
+    pub(crate) fn prompt<'a, W: 'a + Write>(message: &'a str) -> impl SerializeFn<W> + 'a {
+        move |w: WriteContext<W>| {
+            let writer = tuple((
+                age_stanza("prompt", &[], message.as_bytes()),
+                string("\n\n"),
+            ));
+            writer(w)
+        }
+    }
+
+    pub(crate) fn request_secret<'a, W: 'a + Write>(message: &'a str) -> impl SerializeFn<W> + 'a {
+        move |w: WriteContext<W>| {
+            let writer = tuple((
+                age_stanza("request-secret", &[], message.as_bytes()),
                 string("\n\n"),
             ));
             writer(w)
