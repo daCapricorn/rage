@@ -1,11 +1,13 @@
 use age_core::format::AgeStanza;
 use cookie_factory::SerializeFn;
+use secrecy::Secret;
+use std::convert::TryInto;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{ChildStdin, ChildStdout};
 use std::process::{Command, Stdio};
 use zeroize::Zeroize;
 
-use crate::{format::plugin::RecipientLine, keys::FileKey};
+use crate::{error::Error, format::plugin::RecipientLine, keys::FileKey, protocol::Callbacks};
 
 /// Possible responses from an age plugin.
 #[derive(Debug)]
@@ -14,6 +16,10 @@ enum Response<'a> {
     Ok(AgeStanza<'a>),
     /// Request could not be fulfilled.
     Err { code: u16, description: String },
+    /// A prompt needs to be shown.
+    Prompt(String),
+    /// A secret is required.
+    RequestSecret(String),
 }
 
 struct Connection {
@@ -107,6 +113,66 @@ impl KeyWrapper {
                 // TODO: errors
                 Err(io::Error::new(io::ErrorKind::Other, description))
             }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid response at this time",
+            )),
+        }
+    }
+}
+
+pub(crate) struct KeyUnwrapper(Connection);
+
+impl KeyUnwrapper {
+    pub(crate) fn for_plugin(plugin_name: &str, identities: &[String]) -> Result<Self, Error> {
+        Connection::open(plugin_name)
+            .map_err(Error::from)
+            .and_then(|mut conn| {
+                for identity in identities {
+                    conn.write_command(write::add_identity(identity))?;
+                    match conn.read_response()? {
+                        Response::Ok(_) => (),
+                        Response::Err { code, description } => {
+                            // TODO: errors
+                            return Err(Error::DecryptionFailed);
+                        }
+                        _ => return Err(Error::DecryptionFailed),
+                    }
+                }
+                Ok(KeyUnwrapper(conn))
+            })
+    }
+
+    pub(crate) fn unwrap_file_key(
+        &mut self,
+        line: &RecipientLine,
+        callbacks: &dyn Callbacks,
+    ) -> Result<Option<FileKey>, Error> {
+        self.0.write_command(write::unwrap_file_key(line))?;
+        loop {
+            match self.0.read_response()? {
+                Response::Ok(stanza) => {
+                    return stanza.body[..]
+                        .try_into()
+                        .map(Secret::new)
+                        .map(FileKey)
+                        .map(Some)
+                        .map_err(|_| Error::DecryptionFailed);
+                }
+                Response::Err { code, description } => {
+                    // TODO: errors
+                    return Err(Error::DecryptionFailed);
+                }
+                Response::Prompt(message) => callbacks.prompt(&message),
+                Response::RequestSecret(message) => {
+                    if let Some(secret) = callbacks.request_passphrase(&message) {
+                        self.0.write_command(write::secret(secret))?;
+                    } else {
+                        // If user provides no secret, skip this recipient line.
+                        return Ok(None);
+                    }
+                }
+            }
         }
     }
 }
@@ -142,6 +208,10 @@ mod read {
                             description: desc.to_owned(),
                         })
                 }
+                "prompt" => String::from_utf8(response.body).ok().map(Response::Prompt),
+                "request-secret" => String::from_utf8(response.body)
+                    .ok()
+                    .map(Response::RequestSecret),
                 _ => None,
             }),
             pair(newline, newline),
@@ -152,10 +222,21 @@ mod read {
 mod write {
     use age_core::format::write::age_stanza;
     use cookie_factory::{combinator::string, sequence::tuple, SerializeFn, WriteContext};
-    use secrecy::ExposeSecret;
+    use secrecy::{ExposeSecret, SecretString};
     use std::io::Write;
+    use std::iter;
 
-    use crate::keys::FileKey;
+    use crate::{format::plugin::RecipientLine, keys::FileKey};
+
+    pub(crate) fn add_identity<'a, W: 'a + Write>(identity: &'a str) -> impl SerializeFn<W> + 'a {
+        move |w: WriteContext<W>| {
+            let writer = tuple((
+                age_stanza("add-identity", &[], identity.as_bytes()),
+                string("\n\n"),
+            ));
+            writer(w)
+        }
+    }
 
     pub(crate) fn wrap_file_key<'a, W: 'a + Write>(
         recipient: &'a str,
@@ -165,6 +246,31 @@ mod write {
             let args = &[recipient];
             let writer = tuple((
                 age_stanza("wrap-file-key", args, file_key.0.expose_secret()),
+                string("\n\n"),
+            ));
+            writer(w)
+        }
+    }
+
+    pub(crate) fn unwrap_file_key<'a, W: 'a + Write>(
+        line: &'a RecipientLine,
+    ) -> impl SerializeFn<W> + 'a {
+        move |w: WriteContext<W>| {
+            let args: Vec<_> = iter::once(line.tag.as_str())
+                .chain(line.args.iter().map(|s| s.as_str()))
+                .collect();
+            let writer = tuple((
+                age_stanza("unwrap-file-key", &args, &line.body),
+                string("\n\n"),
+            ));
+            writer(w)
+        }
+    }
+
+    pub(crate) fn secret<'a, W: 'a + Write>(secret: SecretString) -> impl SerializeFn<W> + 'a {
+        move |w: WriteContext<W>| {
+            let writer = tuple((
+                age_stanza("secret", &[], secret.expose_secret().as_bytes()),
                 string("\n\n"),
             ));
             writer(w)

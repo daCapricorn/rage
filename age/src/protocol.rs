@@ -3,13 +3,14 @@
 use age_core::primitives::hkdf;
 use rand::{rngs::OsRng, RngCore};
 use secrecy::{ExposeSecret, SecretString};
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, Write};
 use std::iter;
 
 use crate::{
     error::Error,
     format::{oil_the_joint, scrypt, Header, RecipientLine},
-    keys::{FileKey, Identity, RecipientKey},
+    keys::{FileKey, Identity, IdentityKey, RecipientKey},
     plugin,
     primitives::{
         armor::{ArmoredReader, ArmoredWriter},
@@ -23,6 +24,9 @@ const PAYLOAD_KEY_LABEL: &[u8] = b"payload";
 
 /// Callbacks that might be triggered during decryption.
 pub trait Callbacks {
+    /// Shows a prompt.
+    fn prompt(&self, message: &str);
+
     /// Requests a passphrase to decrypt a key.
     fn request_passphrase(&self, description: &str) -> Option<SecretString>;
 }
@@ -30,6 +34,8 @@ pub trait Callbacks {
 struct NoCallbacks;
 
 impl Callbacks for NoCallbacks {
+    fn prompt(&self, _message: &str) {}
+
     fn request_passphrase(&self, _description: &str) -> Option<SecretString> {
         None
     }
@@ -113,8 +119,10 @@ impl Encryptor {
 pub enum Decryptor {
     /// Trial decryption against a list of identities.
     Identities {
-        /// The identities to use.
+        /// Identities that can be handled directly.
         identities: Vec<Identity>,
+        /// Identities that require a plugin.
+        plugin_identities: HashMap<String, Vec<String>>,
         /// A handler for any callbacks triggered by an `Identity`.
         callbacks: Box<dyn Callbacks>,
     },
@@ -134,10 +142,7 @@ impl Decryptor {
     /// The decryptor will have no callbacks registered, so it will be unable to use
     /// identities that require e.g. a passphrase to decrypt.
     pub fn with_identities(identities: Vec<Identity>) -> Self {
-        Decryptor::Identities {
-            identities,
-            callbacks: Box::new(NoCallbacks),
-        }
+        Self::with_identities_and_callbacks(identities, Box::new(NoCallbacks))
     }
 
     /// Creates a decryptor with a list of identities and a callback handler.
@@ -148,8 +153,25 @@ impl Decryptor {
         identities: Vec<Identity>,
         callbacks: Box<dyn Callbacks>,
     ) -> Self {
+        // Partition identities by plugin name
+        let mut plugin_identities: HashMap<String, Vec<String>> = HashMap::new();
+        let identities = identities
+            .into_iter()
+            .filter(|i| match i.key() {
+                IdentityKey::Plugin { name, identity } => {
+                    plugin_identities
+                        .entry(name.clone())
+                        .or_default()
+                        .push(identity.clone());
+                    false
+                }
+                _ => true,
+            })
+            .collect();
+
         Decryptor::Identities {
             identities,
+            plugin_identities,
             callbacks,
         }
     }
@@ -169,8 +191,24 @@ impl Decryptor {
             }
             (
                 Decryptor::Identities {
+                    plugin_identities,
+                    callbacks,
+                    ..
+                },
+                RecipientLine::Plugin(r),
+            ) => plugin_identities
+                .get(&r.tag)
+                .and_then(|identities| {
+                    plugin::KeyUnwrapper::for_plugin(&r.tag, identities)
+                        .and_then(|mut conn| conn.unwrap_file_key(r, callbacks.as_ref()))
+                        .transpose()
+                })
+                .transpose(),
+            (
+                Decryptor::Identities {
                     identities,
                     callbacks,
+                    ..
                 },
                 _,
             ) => identities
