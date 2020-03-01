@@ -1,5 +1,6 @@
 //! Encryption and decryption routines for age.
 
+use age_core::primitives::hkdf;
 use rand::{rngs::OsRng, RngCore};
 use secrecy::{ExposeSecret, SecretString};
 use std::io::{self, Read, Seek, Write};
@@ -11,7 +12,6 @@ use crate::{
     keys::{FileKey, Identity, RecipientKey},
     primitives::{
         armor::{ArmoredReader, ArmoredWriter},
-        hkdf,
         stream::{Stream, StreamReader, StreamWriter},
     },
     Format,
